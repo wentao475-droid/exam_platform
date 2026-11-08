@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  TEACHER
+}
+
+enum SyncState {
+  PENDING
+  SYNCING
+  SYNCED
+  FAILED
+  CONFLICT
+}
+
+enum AuditAction {
+  AI_REVIEW
+  SAVE_DRAFT
+  CONFIRM
+  SYNC_START
+  SYNC_SUCCESS
+  SYNC_FAIL
+  SYNC_CONFLICT
+}
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  name         String
+  role         Role         @default(TEACHER)
+  passwordHash String
+  sessions     Session[]
+  tasks        Task[]
+  audits       Audit[]
+}
+
+model Session {
+  tokenHash String   @id
+  userId    String
+  expiresAt DateTime
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+model Task {
+  id                 String       @id @default(cuid())
+  examUid            String
+  examRoundUid       String
+  examHistoryId      String
+  questionUid        String
+  teacherId          String
+  teacher            User         @relation(fields: [teacherId], references: [id])
+  revision           Int          @default(0)
+  draft              Json?
+  ai                 Json?
+  activeSubmissionId String?      @unique
+  activeSubmission   Submission?  @relation("ActiveSubmission", fields: [activeSubmissionId], references: [id])
+  submissions        Submission[] @relation("TaskSubmissions")
+  audits             Audit[]
+
+  @@unique([examUid, examRoundUid, examHistoryId, questionUid])
+  @@index([teacherId, examUid, examRoundUid])
+}
+
+model Submission {
+  id             String    @id @default(uuid())
+  taskId         String
+  task           Task      @relation("TaskSubmissions", fields: [taskId], references: [id])
+  activeForTask  Task?     @relation("ActiveSubmission")
+  answerVersion  String
+  scores         Json
+  mean           Float
+  comment        String
+  confirmedAt    DateTime  @default(now())
+  state          SyncState @default(PENDING)
+  attempts       Int       @default(0)
+  leaseUntil     DateTime?
+  message        String?
+
+  @@index([taskId])
+}
+
+model Audit {
+  id        String      @id @default(cuid())
+  taskId    String
+  task      Task        @relation(fields: [taskId], references: [id])
+  actorId   String
+  actor     User        @relation(fields: [actorId], references: [id])
+  action    AuditAction
+  detail    String?
+  createdAt DateTime    @default(now())
+
+  @@index([taskId, createdAt])
+}
+
+model MockAnswerVersion {
+  examHistoryId String @id
+  version       String
+}
+
+model MockReceipt {
+  idempotencyKey String   @id
+  examHistoryId  String
+  questionUid    String
+  answerVersion  String
+  scores         Json
+  mean           Float
+  comment        String
+  createdAt      DateTime @default(now())
+
+  @@unique([examHistoryId, questionUid, answerVersion])
+}
