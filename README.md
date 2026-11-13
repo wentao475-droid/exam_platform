@@ -55,8 +55,46 @@ cd "$grading_workspace"
    ```
 
 2. 在本机 `.env` 设置 `EXAM_READ_MODE=live` 和新签发的 `EXAM_PLATFORM_V_TOKEN`。`EXAM_PLATFORM_V_TOKEN_TYPE` 默认 `e-n-p`。若原平台管理员确认还需要 Cookie，可配置 `EXAM_PLATFORM_COOKIE`。
-3. 在 `.env` 的 `EXAM_LIVE_ROUNDS` 填写 JSON 数组，为每个轮次指定 `examUid`、`examRoundUid`、展示名称 `name`、获准的 `teacherEmail`，以及试卷明确的 `taskTwoQuestionUids`。每个轮次配置一位教师。首次联调建议填写 `examHistoryIds`，限制在已授权的测试答卷。使用 `.env.example` 的结构示例，替换所有占位值。
+3. 在 `.env` 的 `EXAM_LIVE_ROUNDS` 填写 JSON 数组。每轮配置 `examUid`、`examRoundUid`、展示名称 `name`、获准的 `teacherEmail` 和大作文题目列表 `taskTwoQuestionUids`（可填空数组）。小作文和口语题目可分别填入 `taskOneQuestionUids`、`speakingQuestionUids`。设置 `"autoDetectTasks": true` 时，已有题目 ID 仍有效，其他题目按答题卡识别。三个列表都为空时也会自动识别。首次联调建议填写 `examHistoryIds`，限定已授权的测试答卷。结构示例见 `.env.example`。
 4. 重启阅卷台，用该教师账号登录，粘贴已配置的轮次链接，用一篇 Writing 测试答卷核对题目与原文。真实读取时，AI 评分和成绩回写依然是模拟操作，原平台的成绩发布由原平台控制。切回 `EXAM_READ_MODE=demo` 并重启可恢复演示流程。
+
+## 真实成绩回写
+
+默认关闭：确认提交只核对原平台答卷版本（读写操作均为只读），不写入任何数据。在 `.env` 中设置 `EXAM_LIVE_WRITE=1` 并重启后，教师点击「确认提交」会调用原平台 `manualCorrect` 接口：
+
+- Writing 分卷（`examSubject=14`）写入教师确认的四维均分（`task2Score`）、写作卷 `scoreLevel`（按两题均值雅思取整，待原平台确认）和逐题批改内容 `correctContent`；
+- 听力、阅读等其他分卷按答题卡原值原样回传，不覆盖原平台已有批改；
+- 提交前重新读取答题卡核对答卷版本，版本已变化时返回冲突，不写入；
+- 失败（网络、授权、原平台拒绝）都会返回可安全重试的结果，由阅卷台的回写状态机自动重试。
+
+开启前务必用 `examHistoryIds` 把联调范围限定在已授权的测试答卷，并与原平台管理员确认 `scoreLevel` 的计算规则。
+
+## AI 批改提供方
+
+AI 批改通过 `AI_PROVIDER` 环境变量切换，默认 `mock` 使用仓库内置的模拟评分（演示流程不变）。设为 `volcengine` 后，单篇和整轮 AI 批改将调用火山方舟（豆包）真实模型，输出仍经过同一套 Zod 结构校验和原文批注定位，教师端无需改动。
+
+1. 在 [火山方舟控制台](https://ark.volcengine.com/apikey) 创建 API Key，并确认目标模型已在[开通管理](https://ark.volcengine.com/openManagement)页面开通。
+2. 在本地 `.env` 中配置：
+
+   ```dotenv
+   AI_PROVIDER=volcengine
+   ARK_API_KEY=你的 API Key
+   ARK_MODEL=doubao-seed-2-1-pro-260915
+   ```
+
+   `ARK_MODEL` 填模型 ID 或推理接入点 ID。可选 `ARK_BASE_URL`（默认 `https://ark.cn-beijing.volces.com/api/v3`）和 `ARK_TIMEOUT_MS`（默认 60000）。
+3. 重启工作台即可。API Key 只保存在服务端 `.env`，不会进入代码库。
+
+### 自定义批改提示词
+
+批改提示词分为两段：固定的「输出格式契约」（JSON 结构、批注定位、简体中文等硬性要求，保证结果可解析）和可配置的「任务说明」段。在 `.env` 中可选配置：
+
+- `AI_PROMPT_EXTRA`：在统一输出契约前追加补充要求，例如「评语面向学生，措辞直接」。
+- `AI_SYSTEM_PROMPT`：整体替换「考官角色 + 评分细则」段。大作文、小作文、口语分别使用 `AI_SYSTEM_PROMPT_TASK2`、`AI_SYSTEM_PROMPT_TASK1`、`AI_SYSTEM_PROMPT_SPEAKING`，缺少专属设置时回退到无后缀的全局值。`AI_PROMPT_EXTRA` 也支持这三个后缀。三科沿用统一 JSON 和四维评语结构。写作小分步长为 0.5，口语小分为整数，发音为训练参考。
+
+两个变量支持多行文本（单引号包裹），任一非空都会派生新的提示词版本号，已有 AI 结果但未保存草稿的任务会按新提示词重新批改。
+
+调用失败（Key 无效、超时、限流、输出不符合结构）时返回 502，任务详情的审计记录会写入失败原因，教师可重试或人工评分。切换提供方后 `promptVersion` 随之变化，同版本已有 AI 结果的任务仍会跳过，避免重复计费。
 
 ## 验证
 
@@ -78,5 +116,7 @@ PostgreSQL 集成测试使用独立的 `grading_test` 数据库。用 Compose �
 ```
 
 本地验收覆盖了 Chrome 中的轮次加载、批注定位、服务重启后恢复草稿、手工评分和模拟回写重试。PostgreSQL 集成测试另行验证并发草稿、重复提交、回写超时恢复、答卷版本冲突和任务权限。
+
+运行测试的注意事项：vitest 4.1.10+ 在 Windows 上存在盘符大小写敏感问题（[#10812](https://github.com/vitest-dev/vitest/issues/10812)），当前工作目录为小写盘符（如 `d:\...`）时所有测试文件会在收集阶段报 `Cannot read properties of undefined (reading 'config')`。请在 PowerShell（默认 `D:\` 大写盘符）中运行 `npm test`；数据库集成测试需设置 `GRADING_INTEGRATION=1` 并把 `DATABASE_URL` 指向 `grading_test` 库。
 
 正式接入的字段、请求方式和验收待办见 [接口说明](docs/api.md)。

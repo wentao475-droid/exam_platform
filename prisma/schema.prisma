@@ -55,6 +55,8 @@ model Task {
   examRoundUid       String
   examHistoryId      String
   questionUid        String
+  // 'task2' | 'task1' | 'speaking'；存量行默认 task2，创建时由配置推导一次。
+  kind               String       @default("task2")
   teacherId          String
   teacher            User         @relation(fields: [teacherId], references: [id])
   revision           Int          @default(0)

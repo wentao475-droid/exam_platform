@@ -12,7 +12,6 @@ const platformErrors: Record<string, string> = {
   LIVE_ROUND_FORBIDDEN: '当前教师账号未获授权读取该轮次，请确认链接或联系管理员。',
   LIVE_UPSTREAM_AUTH: '原考试平台的读取授权无效或已过期，请联系管理员更新。',
   LIVE_UPSTREAM_UNAVAILABLE: '暂时无法读取原考试平台，请稍后重试。',
-  LIVE_QUESTION_NOT_CONFIGURED: '该轮次尚未配置 Task 2 题目，请联系管理员。',
 }
 
 export function requestError(error: unknown, fallback: string) {

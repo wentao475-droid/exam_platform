@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { SCORE_KEYS, SCORE_LABELS, type Annotation, type ScoreKey, type Scores, type TaskDetail } from '~~/shared/grading'
-import { auditLabels, formatAuditDate, syncLabels, syncTypes, workLabels, workTypes } from '~/utils/gradingDisplay'
+import { isMockAi, meanOf, SCORE_LABELS, scoreKeysFor, type Annotation, type Scores, type TaskDetail } from '~~/shared/grading'
+import { auditLabels, formatAuditDate, kindAnswerTitles, kindEyebrows, kindPromptTitles, kindScoreNames, syncLabels, syncTypes, workLabels, workTypes } from '~/utils/gradingDisplay'
 
 definePageMeta({ key: route => route.path })
-useHead({ title: '作文复核' })
+useHead({ title: '阅卷复核' })
 
 const route = useRoute()
 const api = '/api/tasks/' + encodeURIComponent(String(route.params.id))
@@ -13,12 +13,21 @@ const { data: task, error: loadError, refresh, status: loadStatus } = await useA
   () => request<TaskDetail>(api),
 )
 
-const scoreNames: Record<ScoreKey, string> = {
-  tr: '任务回应',
-  cc: '连贯与衔接',
-  lr: '词汇资源',
-  gra: '语法范围与准确性',
-}
+const kind = computed(() => task.value?.kind ?? 'task2')
+const scoreKeys = computed(() => scoreKeysFor(kind.value))
+const scoreNames = computed(() => kindScoreNames[kind.value])
+const scoreCommentHeading = '【四项小分】'
+const annotationCommentHeading = '【原文批注摘录】'
+const maxCommentLength = 12000
+const aiSummaryScores = computed(() => {
+  const ai = task.value?.ai
+  if (!ai) return ''
+  return scoreKeys.value.map(key => {
+    const label = key === 'p' ? '发音（训练参考）' : scoreNames.value[key]
+    const score = ai.scores[key]
+    return score === undefined ? `${label} —` : `${label} ${score} 分`
+  }).join(' · ')
+})
 const scores = reactive<Partial<Scores>>({})
 const comment = ref('')
 const commentEdited = ref(false)
@@ -37,19 +46,54 @@ const conflictNeedsReload = computed(() => conflict.value && (
 ))
 const staleDraft = computed(() => Boolean(task.value?.draft && task.value.draft.answerVersion !== task.value.answerVersion))
 const staleAi = computed(() => Boolean(task.value?.ai && task.value.ai.answerVersion !== task.value.answerVersion))
-const commentSuggestion = computed(() => staleAi.value ? '' : task.value?.ai?.teacherComment ?? '')
+const realAi = computed(() => Boolean(task.value?.ai) && !isMockAi(task.value!.ai!.promptVersion))
+const annotationExcerpt = computed(() => {
+  const entries = (task.value?.ai?.annotations ?? [])
+    .filter(annotation => canLocate(annotation) && annotation.quote.length <= 300)
+    .slice(0, 2)
+  return entries.map(({ quote, comment: note, suggestion }, index) =>
+    [`${index + 1}. “${quote}”`, note, suggestion ? `改进建议：${suggestion}` : ''].filter(Boolean).join('\n'),
+  ).join('\n\n')
+})
+const commentSuggestion = computed(() => {
+  const ai = task.value?.ai
+  return staleAi.value || !ai?.teacherComment ? '' : withCommentAnnotations(withCommentScores(ai.teacherComment, ai.scores))
+})
+const commentWithAnnotations = computed(() => withCommentAnnotations(comment.value))
 const commentPrefilled = computed(() => !task.value?.draft && !task.value?.confirmation && !commentEdited.value && Boolean(commentSuggestion.value))
+const scorePrefill = computed(() => (
+  !task.value?.draft && !task.value?.confirmation && !staleAi.value ? task.value?.ai?.scores ?? null : null
+))
+const scoreHelp = computed(() => {
+  if (locked.value) return '此处显示教师已确认的评分快照。'
+  if (task.value?.draft) return '请独立复核四项分数，再保存草稿。'
+  return task.value?.ai ? '已按 AI 建议预填分数，请独立复核调整后保存草稿。' : '请填写四项分数（0–9，步长 0.5），再保存草稿。'
+})
+const aiSuggestionApplicable = computed(() => {
+  const ai = task.value?.ai
+  if (!ai?.teacherComment || staleAi.value || locked.value) return false
+  return scoreKeys.value.some(key => scores[key] !== ai.scores[key]) || comment.value !== commentSuggestion.value
+})
+
+function adoptAiSuggestion() {
+  const ai = task.value?.ai
+  if (!ai?.teacherComment || staleAi.value || locked.value) return
+  for (const key of scoreKeys.value) scores[key] = ai.scores[key]
+  comment.value = commentSuggestion.value
+  commentEdited.value = true
+}
 const formMean = computed(() => {
-  const values = SCORE_KEYS.map(key => scores[key])
+  const values = scoreKeys.value.map(key => scores[key])
   if (!values.every(validScore)) return null
-  return values.reduce((sum, score) => sum + score, 0) / values.length
+  return meanOf(kind.value, Object.fromEntries(scoreKeys.value.map((key, index) => [key, values[index]!])) as Scores)
 })
 const dirty = computed(() => {
   const draft = task.value?.draft
-  return comment.value !== (draft?.comment ?? '') || SCORE_KEYS.some(key => scores[key] !== draft?.scores[key])
+  return comment.value !== (draft?.comment ?? '') || scoreKeys.value.some(key => scores[key] !== draft?.scores[key])
 })
 const submitReady = computed(() => Boolean(task.value?.draft) && !locked.value && !dirty.value && !staleDraft.value && !conflict.value)
-const syncRetryable = computed(() => task.value?.syncStatus === 'FAILED' || task.value?.syncStatus === 'PENDING')
+const syncRetryable = computed(() => ['FAILED', 'PENDING', 'SYNCED'].includes(task.value?.syncStatus ?? ''))
+const syncRetryLabel = computed(() => task.value?.syncStatus === 'SYNCED' ? '重新回写' : '重试回写')
 const markedText = computed(() => {
   const answer = task.value?.answerText ?? ''
   const annotation = activeAnnotation.value === null ? undefined : task.value?.ai?.annotations[activeAnnotation.value]
@@ -65,9 +109,38 @@ function validScore(value: number | undefined): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 9 && Number.isInteger(value * 2)
 }
 
+function withCommentScores(text: string, values: Scores) {
+  const line = scoreCommentHeading + scoreKeys.value.map(key => {
+    const score = values[key]
+    return `${scoreNames.value[key]} ${validScore(score) ? score + ' 分' : '—'}`
+  }).join(' · ')
+  return text.startsWith(scoreCommentHeading)
+    ? text.replace(/^【四项小分】[^\r\n]*/, line)
+    : [line, text].filter(Boolean).join('\n\n')
+}
+
+function withCommentAnnotations(text: string) {
+  const excerpt = annotationExcerpt.value
+  if (!excerpt || text.includes(annotationCommentHeading)) return text
+  const updated = [text, annotationCommentHeading + '\n' + excerpt].filter(Boolean).join('\n\n')
+  return updated.length <= maxCommentLength ? updated : text
+}
+
+function addCommentAnnotations() {
+  comment.value = commentWithAnnotations.value
+  commentEdited.value = true
+}
+
+watch(() => scoreKeys.value.map(key => scores[key]), () => {
+  if (!locked.value && comment.value.startsWith(scoreCommentHeading)) {
+    comment.value = withCommentScores(comment.value, scores)
+  }
+})
+
 function fillForm() {
   const grade = locked.value ? task.value?.confirmation : task.value?.draft
-  for (const key of SCORE_KEYS) scores[key] = grade?.scores[key]
+  const prefill = scorePrefill.value
+  for (const key of scoreKeys.value) scores[key] = grade?.scores[key] ?? prefill?.[key]
   commentEdited.value = false
   comment.value = grade?.comment ?? (commentPrefilled.value ? commentSuggestion.value : '')
 }
@@ -103,12 +176,19 @@ async function perform(action: NonNullable<typeof pending.value>) {
   actionSuccess.value = ''
 
   let body: Record<string, unknown> = { answerVersion: detail.answerVersion }
-  if (action === 'draft') {
+  if (action === 'ai' && detail.ai) {
+    body.regenerate = true
+  } else if (action === 'draft') {
     if (formMean.value === null) {
       actionError.value = '请填写四项分数，每项为 0–9 分，步长为 0.5。'
       return
     }
-    body = { ...body, revision: detail.revision, scores: { ...scores }, comment: comment.value }
+    const savedComment = withCommentScores(comment.value, scores)
+    if (savedComment.length > maxCommentLength) {
+      actionError.value = '加入四项小分后评语超过字数上限，请缩短评语再保存。'
+      return
+    }
+    body = { ...body, revision: detail.revision, scores: { ...scores }, comment: savedComment }
   } else if (action === 'submit') {
     if (!submitReady.value) return
     body.revision = detail.revision
@@ -120,11 +200,10 @@ async function perform(action: NonNullable<typeof pending.value>) {
   pending.value = action
   try {
     task.value = await $fetch<TaskDetail>(api + '/' + action, { method: action === 'draft' ? 'PUT' : 'POST', body })
-    if (action !== 'ai') fillForm()
+    fillForm()
     if (action === 'ai') {
-      if (commentPrefilled.value) comment.value = commentSuggestion.value
       activeAnnotation.value = null
-      actionSuccess.value = '模拟 AI 预批改已生成。'
+      actionSuccess.value = (realAi.value ? '真实模型' : '模拟 AI') + ' 预批改已生成。'
     } else if (action === 'draft') {
       actionSuccess.value = '草稿已保存。'
     } else if (task.value.syncStatus === 'SYNCED') {
@@ -134,7 +213,7 @@ async function perform(action: NonNullable<typeof pending.value>) {
     const status = (error as { status?: number }).status
     actionError.value = status === 409
       ? requestError(error, '数据已更新，请重新读取答卷。') + ' 重新读取前，可复制尚未保存的评语。'
-      : requestError(error, action === 'ai' ? '模拟 AI 预批改失败，你可以继续手工评分。' : '操作未完成，请稍后重试。')
+      : requestError(error, action === 'ai' ? 'AI 预批改失败，你可以继续手工评分。' : '操作未完成，请稍后重试。')
   } finally {
     pending.value = null
   }
@@ -154,8 +233,8 @@ async function perform(action: NonNullable<typeof pending.value>) {
     <template v-else>
       <header class="review-header">
         <div>
-          <p class="eyebrow">IELTS WRITING · TASK 2</p>
-          <h1>作文复核</h1>
+          <p class="eyebrow">{{ kindEyebrows[kind] }}</p>
+          <h1>阅卷复核</h1>
           <p class="muted">{{ task.examName }} · {{ task.studentCode }}<br>原平台整卷状态 {{ task.sourceStatus }}</p>
         </div>
         <div class="inline-actions">
@@ -169,7 +248,7 @@ async function perform(action: NonNullable<typeof pending.value>) {
         type="info"
         show-icon
         :closable="false"
-        title="这是真实答卷。AI 预批改与回写均为模拟，教师评分仅保存在本阅卷台。"
+        title="这是真实答卷。AI 预批改为模型辅助建议，回写为模拟操作，教师评分仅保存在本阅卷台。"
         class="section-gap"
       />
       <ElAlert v-if="actionError" type="error" show-icon :closable="false" :title="actionError" class="section-gap" />
@@ -184,21 +263,86 @@ async function perform(action: NonNullable<typeof pending.value>) {
       />
 
       <div class="desk">
+        <section class="panel desk-column teacher-panel" aria-labelledby="teacher-heading">
+          <div class="column-heading">
+            <div>
+              <h2 id="teacher-heading">教师评分</h2>
+            </div>
+          </div>
+          <div class="column-content">
+            <p class="score-help muted">{{ scoreHelp }}</p>
+            <ElAlert v-if="staleDraft && !locked" type="warning" title="草稿基于旧版答卷，请复核后重新保存。" :closable="false" class="section-gap" />
+            <ElForm label-position="top" :disabled="isBusy || locked || conflictNeedsReload" @submit.prevent="perform('draft')">
+              <div class="teacher-fields">
+                <div>
+                  <div v-for="key in scoreKeys" :key="key" class="teacher-score">
+                    <label :for="'teacher-score-' + key">
+                      <strong>{{ scoreNames[key] }}</strong>
+                      <small lang="en">{{ SCORE_LABELS[key] }}</small>
+                    </label>
+                    <ElInputNumber
+                      :id="'teacher-score-' + key"
+                      v-model="scores[key]"
+                      :min="0"
+                      :max="9"
+                      :step="0.5"
+                      step-strictly
+                      controls-position="right"
+                      size="small"
+                    />
+                  </div>
+                  <div class="score-total">
+                    <span>四维均分 <small>按雅思规则取整</small></span>
+                    <strong>{{ formMean ?? '—' }}</strong>
+                  </div>
+                </div>
+                <div>
+                  <ElFormItem label="教师评语" for="teacher-comment">
+                    <ElInput id="teacher-comment" v-model="comment" type="textarea" :rows="5" :maxlength="maxCommentLength" show-word-limit @update:model-value="commentEdited = true" />
+                    <p v-if="commentPrefilled" class="muted comment-hint">已按 AI 建议预填评语。四项小分随左侧评分更新，可编辑正文与批注摘录后保存。</p>
+                  </ElFormItem>
+                  <div v-if="!locked" class="inline-actions grade-actions">
+                    <ElButton v-if="aiSuggestionApplicable" plain :disabled="isBusy" @click="adoptAiSuggestion">采用 AI 建议</ElButton>
+                    <ElButton v-if="commentWithAnnotations !== comment" plain :disabled="isBusy" @click="addCommentAnnotations">补入原文批注</ElButton>
+                    <ElButton native-type="submit" :loading="pending === 'draft'" :disabled="conflictNeedsReload || formMean === null">保存草稿</ElButton>
+                    <ElButton type="primary" :disabled="!submitReady || isBusy" :loading="pending === 'submit'" @click="confirmOpen = true">确认提交</ElButton>
+                  </div>
+                </div>
+              </div>
+            </ElForm>
+            <div class="sync-box">
+              <div class="sync-heading">
+                <h3>回写状态</h3>
+                <ElTag :type="syncTypes[task.syncStatus]" effect="plain">{{ syncLabels[task.syncStatus] }}</ElTag>
+              </div>
+              <p v-if="task.confirmation?.syncMessage" class="muted">{{ task.confirmation.syncMessage }}</p>
+              <p v-if="task.confirmation" class="muted">尝试 {{ task.confirmation.syncAttempts }} 次</p>
+              <p v-else class="muted">教师确认后开始回写。</p>
+              <div class="inline-actions sync-actions">
+                <ElButton v-if="syncRetryable" type="primary" plain size="small" :disabled="isBusy" :loading="pending === 'retry'" @click="perform('retry')">
+                  {{ syncRetryLabel }}
+                </ElButton>
+                <ElButton size="small" :disabled="isBusy" @click="reload">重新读取答卷</ElButton>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section class="panel desk-column" aria-labelledby="source-heading">
           <div class="column-heading">
             <div>
-              <p class="eyebrow">01 / 答卷</p>
               <h2 id="source-heading">题目与原文</h2>
             </div>
-            <ElTag type="info" effect="plain">{{ task.wordCount }} 词</ElTag>
+            <ElTag type="info" effect="plain">{{ kind === 'speaking' ? '转写 ' + task.wordCount + ' 词' : task.wordCount + ' 词' }}</ElTag>
           </div>
           <div class="column-content source-content">
             <section aria-labelledby="prompt-heading" class="prompt-box">
-              <h3 id="prompt-heading">Task 2 题目</h3>
+              <h3 id="prompt-heading">{{ kindPromptTitles[kind] }}</h3>
               <!-- promptHtml is allowlisted by the server before serialization. -->
               <div class="prompt-text" lang="en" v-html="task.promptHtml" />
             </section>
-            <h3 class="essay-title">学生作文</h3>
+            <h3 class="essay-title">{{ kindAnswerTitles[kind] }}</h3>
+            <p v-if="kind === 'speaking'" class="muted speaking-note">发音维度基于转写文本评估，仅供参考，建议结合录音复核。</p>
             <p class="essay-text" lang="en"><span>{{ markedText.before }}</span><mark v-if="markedText.match" ref="highlight" tabindex="-1">{{ markedText.match }}</mark><span>{{ markedText.after }}</span></p>
           </div>
         </section>
@@ -206,7 +350,6 @@ async function perform(action: NonNullable<typeof pending.value>) {
         <section class="panel desk-column" aria-labelledby="ai-heading">
           <div class="column-heading">
             <div>
-              <p class="eyebrow">02 / 建议</p>
               <h2 id="ai-heading">AI 预批改</h2>
             </div>
             <ElButton size="small" :loading="pending === 'ai'" :disabled="isBusy" @click="perform('ai')">
@@ -214,14 +357,17 @@ async function perform(action: NonNullable<typeof pending.value>) {
             </ElButton>
           </div>
           <div class="column-content">
-            <ElEmpty v-if="!task.ai" description="可生成模拟 AI 预批改，也可直接手工评分。" :image-size="62" />
+            <ElEmpty v-if="!task.ai" description="可生成 AI 预批改，也可直接手工评分。" :image-size="62" />
             <template v-else>
               <ElAlert v-if="staleAi" type="warning" title="此建议基于旧版答卷，可重新生成。" :closable="false" class="section-gap" />
-              <p class="ai-summary">{{ task.ai.summary }}</p>
-              <div v-for="key in SCORE_KEYS" :key="key" class="ai-score">
+              <div class="ai-summary">
+                <p>{{ task.ai.summary }}</p>
+                <p class="ai-summary-scores"><strong>四项小分</strong> {{ aiSummaryScores }}</p>
+              </div>
+              <div v-for="key in scoreKeys" :key="key" class="ai-score">
                 <div class="ai-score-heading">
                   <div>
-                    <h3>{{ scoreNames[key] }}</h3>
+                    <h3>{{ key === 'p' ? '发音（训练参考）' : scoreNames[key] }}</h3>
                     <p class="muted score-label" lang="en">{{ SCORE_LABELS[key] }}</p>
                   </div>
                   <ElTag type="primary" effect="light">{{ task.ai.scores[key] }}</ElTag>
@@ -247,66 +393,7 @@ async function perform(action: NonNullable<typeof pending.value>) {
                   <li v-for="(suggestion, index) in task.ai.suggestions" :key="index">{{ suggestion }}</li>
                 </ul>
               </section>
-              <p class="prompt-version muted">模拟 AI · 提示词 {{ task.ai.promptVersion }}</p>
             </template>
-          </div>
-        </section>
-
-        <section class="panel desk-column" aria-labelledby="teacher-heading">
-          <div class="column-heading">
-            <div>
-              <p class="eyebrow">03 / 复核</p>
-              <h2 id="teacher-heading">教师评分</h2>
-            </div>
-          </div>
-          <div class="column-content">
-            <p class="score-help muted">{{ locked ? '此处显示教师已确认的评分快照。' : '请独立确认四项分数，再保存草稿。' }}</p>
-            <ElAlert v-if="staleDraft && !locked" type="warning" title="草稿基于旧版答卷，请复核后重新保存。" :closable="false" class="section-gap" />
-            <ElForm label-position="top" :disabled="isBusy || locked || conflictNeedsReload" @submit.prevent="perform('draft')">
-              <div v-for="key in SCORE_KEYS" :key="key" class="teacher-score">
-                <label :for="'teacher-score-' + key">
-                  <strong>{{ scoreNames[key] }}</strong>
-                  <small lang="en">{{ SCORE_LABELS[key] }}</small>
-                </label>
-                <ElInputNumber
-                  :id="'teacher-score-' + key"
-                  v-model="scores[key]"
-                  :min="0"
-                  :max="9"
-                  :step="0.5"
-                  step-strictly
-                  controls-position="right"
-                  size="small"
-                />
-              </div>
-              <div class="score-total">
-                <span>四维均分 <small>未取整</small></span>
-                <strong>{{ formMean ?? '—' }}</strong>
-              </div>
-              <ElFormItem label="教师评语" for="teacher-comment">
-                <ElInput id="teacher-comment" v-model="comment" type="textarea" :rows="5" :maxlength="12000" show-word-limit @update:model-value="commentEdited = true" />
-                <p v-if="commentPrefilled" class="muted comment-hint">模拟 AI 已预填评语，可修改后随评分一起保存。</p>
-              </ElFormItem>
-              <div v-if="!locked" class="inline-actions grade-actions">
-                <ElButton native-type="submit" :loading="pending === 'draft'" :disabled="conflictNeedsReload || formMean === null">保存草稿</ElButton>
-                <ElButton type="primary" :disabled="!submitReady || isBusy" :loading="pending === 'submit'" @click="confirmOpen = true">确认提交</ElButton>
-              </div>
-            </ElForm>
-            <div class="sync-box">
-              <div class="sync-heading">
-                <h3>模拟回写状态</h3>
-                <ElTag :type="syncTypes[task.syncStatus]" effect="plain">{{ syncLabels[task.syncStatus] }}</ElTag>
-              </div>
-              <p v-if="task.confirmation?.syncMessage" class="muted">{{ task.confirmation.syncMessage }}</p>
-              <p v-if="task.confirmation" class="muted">尝试 {{ task.confirmation.syncAttempts }} 次</p>
-              <p v-else class="muted">教师确认后开始模拟回写。</p>
-              <div class="inline-actions sync-actions">
-                <ElButton v-if="syncRetryable" type="primary" plain size="small" :disabled="isBusy" :loading="pending === 'retry'" @click="perform('retry')">
-                  重试回写
-                </ElButton>
-                <ElButton size="small" :disabled="isBusy" @click="reload">重新读取答卷</ElButton>
-              </div>
-            </div>
           </div>
         </section>
       </div>
@@ -339,19 +426,21 @@ async function perform(action: NonNullable<typeof pending.value>) {
 .retry-load { margin-top: 12px; }
 .review-header { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 14px; margin-bottom: 22px; }
 .review-header .muted { margin-top: 7px; }
-.desk { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1.05fr) minmax(0, .98fr); gap: 14px; align-items: start; }
+.desk { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 14px; align-items: start; }
 .desk-column { overflow: clip; }
+.teacher-panel { grid-column: 1 / -1; }
 .column-heading { min-height: 77px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line); padding: 12px 17px; background: #fbfcff; }
-.column-heading .eyebrow { margin-bottom: 3px; }
 .column-content { padding: 17px; }
 .source-content { max-height: min(75vh, 780px); overflow-y: auto; }
 .prompt-box { background: #f0f5fd; border: 1px solid #e4edf9; border-radius: 8px; padding: 12px 14px; }
 .prompt-text { margin-top: 7px; overflow-wrap: anywhere; }
 .prompt-text :deep(p + p) { margin-top: .55em; }
 .essay-title { margin: 17px 0 8px; }
+.speaking-note { font-size: 12px; margin-bottom: 8px; }
 .essay-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; }
 .essay-text mark { background: #ffe3a0; color: #292106; border-radius: 2px; scroll-margin: 16px; }
 .ai-summary { margin-bottom: 9px; }
+.ai-summary-scores { margin-top: 6px; }
 .ai-score { padding-block: 10px; border-bottom: 1px solid var(--line); }
 .ai-score-heading, .sync-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 7px; }
 .score-label { font-size: 11px; line-height: 1.35; }
@@ -362,8 +451,8 @@ async function perform(action: NonNullable<typeof pending.value>) {
 .annotation-link { margin-top: 5px; }
 .annotation-note { display: inline-block; font-size: 12px; margin-top: 4px; }
 .suggestions { padding-inline-start: 18px; margin: 6px 0 0; font-size: 13px; }
-.prompt-version { margin-top: 12px; font-size: 12px; }
 .score-help { margin-bottom: 8px; font-size: 13px; }
+.teacher-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr); gap: 20px; }
 .teacher-score { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-block: 7px; border-bottom: 1px solid var(--line); }
 .teacher-score small { display: block; color: var(--muted); font-size: 10px; line-height: 1.3; }
 .teacher-score .el-input-number { width: 83px; flex: 0 0 83px; }
@@ -382,13 +471,9 @@ async function perform(action: NonNullable<typeof pending.value>) {
 .audit-list li span { margin-left: 7px; }
 .audit-list time { grid-column: 3; }
 
-@media (max-width: 1060px) {
-  .desk { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .desk-column:last-child { grid-column: 1 / -1; }
-}
-
 @media (max-width: 660px) {
-  .desk { grid-template-columns: minmax(0, 1fr); }
+  .desk, .teacher-fields { grid-template-columns: minmax(0, 1fr); }
+  .teacher-fields { gap: 8px; }
   .audit-list li { grid-template-columns: 1fr; }
   .audit-list time { grid-column: 1; }
 }

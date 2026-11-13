@@ -97,7 +97,7 @@ useHead({
         <section class="login-card panel" aria-labelledby="login-title">
           <p class="eyebrow">IELTS WRITING · TASK 2</p>
           <h1 id="login-title">登录教师阅卷台</h1>
-          <p class="muted">{{ readMode === 'live' ? '使用已获授权的教师账号读取真实答卷。AI 预批改与回写仍为模拟。' : '使用演示教师账号进入工作台，体验作文复核、草稿保存和模拟回写。' }}</p>
+          <p class="muted">{{ readMode === 'live' ? '使用已获授权的教师账号读取真实答卷。AI 预批改为模型辅助建议，回写仍为模拟。' : '使用演示教师账号进入工作台，体验作文复核、草稿保存和模拟回写。' }}</p>
           <ElAlert v-if="notice" type="error" :closable="false" show-icon :title="notice" class="section-gap" />
           <ElForm label-position="top" class="login-form" @submit.prevent="signIn">
             <ElFormItem label="教师邮箱" for="teacher-email">

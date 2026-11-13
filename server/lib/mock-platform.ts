@@ -1,34 +1,43 @@
-import { SCORE_KEYS } from '../../shared/grading'
-import { DEMO_ROUND, demoBehavior, demoCard, demoList, taskTwoUid } from './demo'
+import type { TaskKind } from '../../shared/grading'
+import { SCORE_KEYS_BY_KIND } from '../../shared/grading'
+import { DEMO_ROUND, demoBehavior, demoCard, demoList, demoSpeakingUid, taskOneUid, taskTwoUid } from './demo'
 import { prisma } from './prisma'
 import { normalizeAnswer, normalizeList, type ExamPlatformAdapter, type RoundKey } from './source'
-import { scoresSchema } from './validation'
+import { scoresSchemaFor } from './validation'
 
 function isDemoRound(round: RoundKey) {
   return round.examUid === DEMO_ROUND.examUid && round.examRoundUid === DEMO_ROUND.examRoundUid
 }
 
+const kindByUid: Record<string, TaskKind> = {
+  [taskOneUid]: 'task1',
+  [taskTwoUid]: 'task2',
+  [demoSpeakingUid]: 'speaking',
+}
+
 export const mockPlatform: ExamPlatformAdapter = {
   async listWriting(round) {
     if (!isDemoRound(round)) return null
-    return { name: DEMO_ROUND.name, rows: normalizeList(demoList).rows }
+    return { name: DEMO_ROUND.name, rows: normalizeList(demoList, [14, 13]).rows }
   },
 
   async readAnswer(ref) {
-    if (!isDemoRound(ref) || ref.questionUid !== taskTwoUid) return null
+    const kind = kindByUid[ref.questionUid]
+    if (!isDemoRound(ref) || !kind) return null
 
     const raw = demoCard(ref.examHistoryId)
     if (!raw) return null
-    const answer = normalizeAnswer(raw, ref)
+    const answer = normalizeAnswer(raw, ref, kind)
     const state = await prisma.mockAnswerVersion.findUnique({ where: { examHistoryId: ref.examHistoryId } })
     return answer && state ? { ...answer, answerVersion: state.version } : null
   },
 
   async writeResult(result, attempt) {
-    if (!isDemoRound(result) || result.questionUid !== taskTwoUid) {
+    if (!isDemoRound(result) || !kindByUid[result.questionUid]) {
       return { state: 'FAILED', message: '演示回写不支持该题目' }
     }
     const { idempotencyKey, examHistoryId, questionUid, answerVersion, scores, mean, comment } = result
+    const scoreKeys = SCORE_KEYS_BY_KIND[result.kind]
     return await prisma.$transaction(async tx => {
       const receiptKey = { idempotencyKey }
       // A no-op update locks the source version until the simulated remote write commits.
@@ -38,10 +47,10 @@ export const mockPlatform: ExamPlatformAdapter = {
       })
       const prior = await tx.mockReceipt.findUnique({ where: receiptKey })
       if (prior) {
-        const previousScores = scoresSchema.safeParse(prior.scores)
+        const previousScores = scoresSchemaFor(result.kind).safeParse(prior.scores)
         const sameResult = prior.examHistoryId === examHistoryId && prior.questionUid === questionUid
           && prior.answerVersion === answerVersion && prior.mean === mean && prior.comment === comment
-          && previousScores.success && SCORE_KEYS.every(key => previousScores.data[key] === scores[key])
+          && previousScores.success && scoreKeys.every(key => previousScores.data[key] === scores[key])
         return sameResult
           ? { state: 'SYNCED' }
           : { state: 'FAILED', message: '模拟回写幂等键与既有记录不匹配' }
